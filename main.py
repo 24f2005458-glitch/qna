@@ -369,18 +369,19 @@ def fetch_export_payload(url):
         return None
 
     response = fetch_response(url)
-    content_type = response.headers.get("content-type", "").lower()
-
-    if "json" in content_type:
-        return response.json()
-
-    # Support CSV exports too.
-    text = response.text
-    try:
-        return list(csv.DictReader(io.StringIO(text)))
-    except Exception:
-        logger.warning("Could not parse export response as CSV")
-        return None
+    return response.json()
+#    content_type = response.headers.get("content-type", "").lower()
+#
+#   if "json" in content_type:
+#      return response.json()
+#
+#    # Support CSV exports too.
+#    text = response.text
+#    try:
+#        return list(csv.DictReader(io.StringIO(text)))
+#    except Exception:
+#        logger.warning("Could not parse export response as CSV")
+#        return None
 
 
 def find_refund_records(payload):
