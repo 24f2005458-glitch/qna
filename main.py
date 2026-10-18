@@ -1,12 +1,16 @@
 
 import os
 import re
+import csv
+import io
+import json
 import logging
-from decimal import Decimal, ROUND_HALF_UP
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from decimal import Decimal, InvalidOperation
+from datetime import datetime, date
+from zoneinfo import ZoneInfo
+from collections import defaultdict, deque
 
 import requests
-import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
@@ -14,33 +18,20 @@ from pydantic import BaseModel, Field
 # Configuration
 # ---------------------------------------------------------
 
-METADATA_URL = os.environ["QUESTION_DATA_URL"]
+QUESTION_DATA_URL = os.getenv("QUESTION_DATA_URL", "").strip()
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
+BUSINESS_TZ = ZoneInfo("Asia/Kolkata")
 
-MAX_PAGES = 85
-TIMEOUT = 30
-
-# Set this to match your rates endpoint:
-#
-# "units_per_usd":
-#   rate means units of that currency per 1 USD.
-#   Example: USD=1, EUR=0.92, INR=83.
-#
-# "usd_per_unit":
-#   rate means USD per 1 unit of that currency.
-#
-# Verify the actual rates response before selecting this.
-RATE_MODE = os.getenv("RATE_MODE", "units_per_usd")
-
-# Used only if the orders dataset has no currency column.
-# Change this if the API documentation establishes another
-# default currency. Do not guess if currencies are mixed.
-DEFAULT_CURRENCY = os.getenv("DEFAULT_CURRENCY", "USD").upper()
+# If the rates endpoint does not specify its base currency,
+# assume its rates are units of each currency per USD.
+DEFAULT_RATE_BASE = os.getenv("DEFAULT_RATE_BASE", "USD").upper()
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Ledger Question Answering API")
-session = requests.Session()
+app = FastAPI(title="Order Ledger Question API")
+http = requests.Session()
+http.headers.update({"Accept": "application/json"})
 
 
 class QuestionRequest(BaseModel):
@@ -48,629 +39,835 @@ class QuestionRequest(BaseModel):
 
 
 # ---------------------------------------------------------
-# HTTP and endpoint discovery
+# HTTP and JSON helpers
 # ---------------------------------------------------------
 
-def get_json(url, params=None):
-    response = session.get(url, params=params, timeout=TIMEOUT)
+def fetch_response(url):
+    response = http.get(url, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
+    return response
+
+
+def fetch_json(url):
+    response = fetch_response(url)
     return response.json()
 
 
-def discover_endpoints(obj):
-    found = {}
-
-    def walk(value):
-        if isinstance(value, dict):
-            for key, item in value.items():
-                key_lower = str(key).lower()
-
-                if isinstance(item, str) and item.startswith("http"):
-                    for name in ("orders", "rates", "exports"):
-                        if name in key_lower:
-                            found[name] = item
-
-                elif isinstance(item, dict):
-                    link = item.get("url") or item.get("href")
-
-                    if isinstance(link, str) and link.startswith("http"):
-                        for name in ("orders", "rates", "exports"):
-                            if name in key_lower:
-                                found[name] = link
-
-                    walk(item)
-
-                elif isinstance(item, list):
-                    walk(item)
-
-        elif isinstance(value, list):
-            for item in value:
-                walk(item)
-
-    walk(obj)
-    return found
-
-
-def add_page_parameter(url, page):
-    parts = urlparse(url)
-    params = parse_qs(parts.query, keep_blank_values=True)
-    params["page"] = [str(page)]
-
-    return urlunparse(
-        parts._replace(query=urlencode(params, doseq=True))
-    )
-
-
-def extract_records(payload):
-    """Extract records from common API response structures."""
-
-    if isinstance(payload, list):
-        if all(isinstance(x, dict) for x in payload):
-            return payload
-
-        records = []
-        for item in payload:
-            records.extend(extract_records(item))
-        return records
-
-    if isinstance(payload, dict):
-        for key in (
-            "orders", "data", "results", "items", "records",
-            "rates", "exports", "refunds"
-        ):
-            value = payload.get(key)
-            if isinstance(value, list):
-                return extract_records(value)
-
-        # A single record rather than a list.
-        if any(
-            key.lower() in {
-                "order_id", "orderid", "amount", "total",
-                "revenue", "refund_amount"
-            }
-            for key in payload
-        ):
-            return [payload]
-
-    return []
-
-
-def load_orders(url):
-    records = []
-
-    for page in range(1, MAX_PAGES + 1):
-        payload = get_json(add_page_parameter(url, page))
-        rows = extract_records(payload)
-
-        if not rows:
-            log.info("No records on page %d; stopping.", page)
-            break
-
-        records.extend(rows)
-        log.info("Page %d: loaded %d records", page, len(rows))
-
-    if not records:
-        raise RuntimeError("No order records were found.")
-
-    return pd.DataFrame(records)
-
-
-# ---------------------------------------------------------
-# Column mapping
-# ---------------------------------------------------------
-
-ALIASES = {
-    "date": [
-        "order_date", "created_at", "date", "transaction_date"
-    ],
-    "region": ["region", "sales_region", "order_region"],
-    "status": [
-        "status", "order_status", "payment_status",
-        "payment_state", "financial_status"
-    ],
-    "currency": [
-        "currency", "currency_code", "order_currency"
-    ],
-    "amount": [
-        "total_amount", "order_total", "order_value",
-        "total_price", "grand_total", "amount", "revenue"
-    ],
-    "refund": [
-        "refund_amount", "refunded_amount", "refund_total"
-    ],
-    "product": ["product_name", "product", "item_name"],
-    "customer": ["customer_name", "customer", "customer_id"],
-}
-
-
-def norm(value):
+def normalize(value):
     return re.sub(r"[^a-z0-9]", "", str(value).lower())
 
 
-def find_column(df, candidates):
-    lookup = {norm(col): col for col in df.columns}
+def decimal_value(value):
+    if value is None:
+        return None
 
-    for candidate in candidates:
-        if norm(candidate) in lookup:
-            return lookup[norm(candidate)]
+    try:
+        result = Decimal(str(value).replace(",", "").strip())
+        return result if result.is_finite() else None
+    except (InvalidOperation, ValueError, TypeError):
+        return None
 
-    # Allow common variations such as order_total_usd.
-    for col in df.columns:
-        normalized = norm(col)
-        for candidate in candidates:
-            candidate_normalized = norm(candidate)
-            if (
-                len(candidate_normalized) >= 5
-                and candidate_normalized in normalized
+
+def money(value):
+    return str(Decimal(value).quantize(Decimal("0.01")))
+
+
+def parse_datetime(value):
+    if not value:
+        return None
+
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+        # API business dates use Asia/Kolkata. If a timestamp has
+        # no timezone, interpret it in the business timezone.
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=BUSINESS_TZ)
+
+        return dt.astimezone(BUSINESS_TZ)
+    except (ValueError, TypeError):
+        return None
+
+
+# ---------------------------------------------------------
+# Metadata and pagination
+# ---------------------------------------------------------
+
+def load_metadata():
+    if not QUESTION_DATA_URL:
+        raise RuntimeError("QUESTION_DATA_URL is not configured")
+
+    metadata = fetch_json(QUESTION_DATA_URL)
+
+    if not isinstance(metadata, dict):
+        raise RuntimeError("Metadata response is not a JSON object")
+
+    links = metadata.get("links", {})
+    if not isinstance(links, dict):
+        raise RuntimeError("Metadata does not contain a links object")
+
+    if not links.get("orders"):
+        raise RuntimeError("Metadata has no orders link")
+
+    if not links.get("rates"):
+        raise RuntimeError("Metadata has no rates link")
+
+    return metadata
+
+
+def fetch_all_orders(first_url):
+    """
+    Follow the API's `next` URL rather than constructing page URLs.
+    This preserves the signed query parameters and follows the
+    server's own pagination instructions.
+    """
+    rows = []
+    seen_pages = set()
+    url = first_url
+
+    while url:
+        if url in seen_pages:
+            raise RuntimeError("Repeated pagination URL detected")
+
+        seen_pages.add(url)
+
+        payload = fetch_json(url)
+
+        if not isinstance(payload, dict):
+            raise RuntimeError("Unexpected orders response format")
+
+        page_rows = payload.get("orders", [])
+        if not isinstance(page_rows, list):
+            raise RuntimeError("The orders field is not a list")
+
+        rows.extend(
+            row for row in page_rows if isinstance(row, dict)
+        )
+
+        logger.info(
+            "Loaded orders page %s of %s",
+            payload.get("page", "?"),
+            payload.get("pages", "?"),
+        )
+
+        # The API supplies the next page URL.
+        url = payload.get("next")
+
+    return rows
+
+
+def deduplicate_orders(rows):
+    """
+    An order ID can occur more than once.
+    Keep the record with the latest updated_at timestamp.
+    """
+    current = {}
+
+    for index, row in enumerate(rows):
+        order_id = row.get("id")
+
+        if order_id is None:
+            # Do not accidentally merge records lacking an ID.
+            current[f"__missing_id_{index}"] = row
+            continue
+
+        key = str(order_id)
+
+        if key not in current:
+            current[key] = row
+            continue
+
+        old_dt = parse_datetime(current[key].get("updated_at"))
+        new_dt = parse_datetime(row.get("updated_at"))
+
+        if new_dt is not None and (
+            old_dt is None or new_dt > old_dt
+        ):
+            current[key] = row
+
+    return list(current.values())
+
+
+# ---------------------------------------------------------
+# Currency conversion
+# ---------------------------------------------------------
+
+class CurrencyConverter:
+    """
+    Builds a directed graph of currency conversion factors.
+
+    Supported rate formats include:
+      {"base": "USD", "rates": {"EUR": 0.92, "INR": 83.1}}
+      {"USD": 1, "EUR": 0.92, "INR": 83.1}
+      [{"currency": "EUR", "rate": 0.92}, ...]
+      [{"from": "USD", "to": "EUR", "rate": 0.92}, ...]
+
+    For a base/rates object, rates are interpreted as units of the
+    quoted currency per one unit of the base currency.
+
+    If your endpoint defines a different convention, adjust
+    _read_rate_payload() to match its actual response.
+    """
+
+    def __init__(self, payload):
+        self.graph = defaultdict(dict)
+        self._read_rate_payload(payload)
+        self.graph.setdefault("USD", {})["USD"] = Decimal("1")
+        self.graph.setdefault("EUR", {})["EUR"] = Decimal("1")
+        self.graph.setdefault("INR", {})["INR"] = Decimal("1")
+
+    def add_rate(self, source, target, factor):
+        source = str(source).upper().strip()
+        target = str(target).upper().strip()
+        factor = decimal_value(factor)
+
+        if not source or not target or factor is None or factor <= 0:
+            return
+
+        # factor = units of target currency per one unit of source.
+        self.graph[source][target] = factor
+        self.graph[target][source] = Decimal("1") / factor
+
+    def _read_rate_payload(self, payload):
+        if isinstance(payload, list):
+            for item in payload:
+                if isinstance(item, dict):
+                    self._read_rate_payload(item)
+            return
+
+        if not isinstance(payload, dict):
+            return
+
+        # Explicit pairwise exchange rate.
+        source = (
+            payload.get("from_currency")
+            or payload.get("from")
+            or payload.get("base_currency")
+        )
+        target = (
+            payload.get("to_currency")
+            or payload.get("to")
+            or payload.get("quote_currency")
+        )
+        factor = (
+            payload.get("exchange_rate")
+            or payload.get("conversion_rate")
+            or payload.get("rate")
+        )
+
+        if source and target and factor is not None:
+            self.add_rate(source, target, factor)
+            return
+
+        # Standard base + rates object.
+        base = (
+            payload.get("base")
+            or payload.get("base_currency")
+            or payload.get("baseCurrency")
+        )
+        rates = payload.get("rates")
+
+        if isinstance(rates, dict):
+            base = str(base or DEFAULT_RATE_BASE).upper()
+
+            self.graph[base][base] = Decimal("1")
+
+            for currency, rate in rates.items():
+                factor = decimal_value(rate)
+                if factor is not None and factor > 0:
+                    self.add_rate(base, currency, factor)
+
+            return
+
+        if isinstance(rates, list):
+            self._read_rate_payload(rates)
+            return
+
+        # Single currency-rate row.
+        currency = (
+            payload.get("currency")
+            or payload.get("currency_code")
+            or payload.get("code")
+        )
+        rate = (
+            payload.get("rate")
+            or payload.get("exchange_rate")
+            or payload.get("conversion_rate")
+        )
+
+        if currency and rate is not None:
+            base = str(
+                payload.get("base")
+                or payload.get("base_currency")
+                or DEFAULT_RATE_BASE
+            ).upper()
+            self.add_rate(base, currency, rate)
+            return
+
+        # Flat mapping such as {"USD": 1, "EUR": 0.92, "INR": 83.1}.
+        currency_codes = {"USD", "EUR", "INR"}
+        numeric_items = {
+            str(k).upper(): decimal_value(v)
+            for k, v in payload.items()
+            if str(k).upper() in currency_codes
+        }
+
+        if numeric_items and all(v is not None and v > 0
+                                 for v in numeric_items.values()):
+            base = str(
+                payload.get("base") or DEFAULT_RATE_BASE
+            ).upper()
+
+            for currency, rate in numeric_items.items():
+                self.add_rate(base, currency, rate)
+
+    def convert(self, amount, source, target="USD"):
+        amount = decimal_value(amount)
+
+        if amount is None:
+            raise ValueError("Amount is not numeric")
+
+        source = str(source or "USD").upper()
+        target = str(target or "USD").upper()
+
+        if source == target:
+            return amount
+
+        # Find a conversion path using breadth-first search.
+        queue = deque([(source, Decimal("1"))])
+        visited = {source}
+
+        while queue:
+            currency, factor_so_far = queue.popleft()
+
+            for next_currency, factor in self.graph.get(
+                currency, {}
+            ).items():
+                if next_currency in visited:
+                    continue
+
+                new_factor = factor_so_far * factor
+
+                if next_currency == target:
+                    return amount * new_factor
+
+                visited.add(next_currency)
+                queue.append((next_currency, new_factor))
+
+        raise ValueError(
+            f"No conversion path from {source} to {target}. "
+            "Check the rates endpoint schema."
+        )
+
+
+# ---------------------------------------------------------
+# Load optional export data
+# ---------------------------------------------------------
+
+def fetch_export_payload(url):
+    if not url:
+        return None
+
+    response = fetch_response(url)
+    content_type = response.headers.get("content-type", "").lower()
+
+    if "json" in content_type:
+        return response.json()
+
+    # Support CSV exports too.
+    text = response.text
+    try:
+        return list(csv.DictReader(io.StringIO(text)))
+    except Exception:
+        logger.warning("Could not parse export response as CSV")
+        return None
+
+
+def find_refund_records(payload):
+    """
+    Look for refund records in common export structures.
+    Returns None if no explicit refund collection is found.
+    """
+    if isinstance(payload, list):
+        if payload and all(isinstance(x, dict) for x in payload):
+            if any(
+                "refund" in normalize(k)
+                for row in payload
+                for k in row.keys()
             ):
-                return col
+                return payload
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    for key, value in payload.items():
+        if "refund" in normalize(key):
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict):
+                for subkey in ("records", "items", "results", "data"):
+                    if isinstance(value.get(subkey), list):
+                        return value[subkey]
+
+    for value in payload.values():
+        result = find_refund_records(value)
+        if result is not None:
+            return result
 
     return None
 
 
-def get_column(df, logical_name):
-    return find_column(df, ALIASES[logical_name])
+def load_data():
+    metadata = load_metadata()
+    links = metadata["links"]
 
+    raw_orders = fetch_all_orders(links["orders"])
+    orders = deduplicate_orders(raw_orders)
 
-# ---------------------------------------------------------
-# Currency rates
-# ---------------------------------------------------------
+    rates_payload = fetch_json(links["rates"])
+    converter = CurrencyConverter(rates_payload)
 
-def collect_dict_records(payload):
-    """Recursively collect dictionaries from nested rate JSON."""
-
-    records = []
-
-    if isinstance(payload, dict):
-        records.append(payload)
-        for value in payload.values():
-            records.extend(collect_dict_records(value))
-
-    elif isinstance(payload, list):
-        for value in payload:
-            records.extend(collect_dict_records(value))
-
-    return records
-
-
-def build_rates(payload):
-    """
-    Return rates keyed by currency code.
-
-    This supports common row-based formats, but the actual
-    rates schema must be checked. Ambiguous rate fields should
-    be mapped explicitly rather than guessed.
-    """
-    result = {"USD": Decimal("1")}
-
-    for record in collect_dict_records(payload):
-        code = (
-            record.get("currency")
-            or record.get("currency_code")
-            or record.get("code")
-        )
-
-        rate = (
-            record.get("rate")
-            if "rate" in record
-            else record.get("exchange_rate")
-        )
-
-        if code is None or rate is None:
-            continue
-
-        code = str(code).strip().upper()
-
-        if not re.fullmatch(r"[A-Z]{3}", code):
-            continue
-
-        try:
-            rate = Decimal(str(rate))
-        except Exception:
-            continue
-
-        if rate > 0:
-            result[code] = rate
-
-    return result
-
-
-def to_usd(amount, currency, rates):
-    amount = Decimal(str(amount))
-    currency = str(currency).upper().strip()
-
-    if currency == "USD":
-        return amount
-
-    if currency not in rates:
-        raise ValueError(
-            f"No exchange rate found for {currency}. "
-            "Check the rates endpoint and build_rates()."
-        )
-
-    rate = rates[currency]
-
-    if RATE_MODE == "units_per_usd":
-        return amount / rate
-
-    if RATE_MODE == "usd_per_unit":
-        return amount * rate
-
-    raise ValueError(
-        "RATE_MODE must be units_per_usd or usd_per_unit."
+    export_payload = fetch_export_payload(
+        links.get("export") or links.get("exports")
     )
+
+    refund_records = find_refund_records(export_payload)
+
+    logger.info(
+        "Loaded %d raw order rows; %d current orders",
+        len(raw_orders),
+        len(orders),
+    )
+
+    return {
+        "metadata": metadata,
+        "orders": orders,
+        "converter": converter,
+        "export": export_payload,
+        "refund_records": refund_records,
+    }
+
+
+DATA = None
+LOAD_ERROR = None
+
+try:
+    DATA = load_data()
+except Exception as exc:
+    LOAD_ERROR = str(exc)
+    logger.exception("Initial data load failed")
 
 
 # ---------------------------------------------------------
 # Question interpretation
 # ---------------------------------------------------------
 
-def requested_currency(question):
-    q = question.lower()
-
-    if re.search(r"\b(eur|euros?|€)\b", q):
-        return "EUR"
-
-    if re.search(r"\b(inr|rupees?|₹)\b", q):
-        return "INR"
-
-    # Default for questions asking for US dollars, USD,
-    # or order value without another currency.
-    return "USD"
+MONTHS = {
+    "january": 1, "february": 2, "march": 3,
+    "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9,
+    "october": 10, "november": 11, "december": 12,
+}
 
 
-def requested_operation(question):
-    q = question.lower()
-
-    if re.search(
-        r"\b(average|averages|on average|mean|per order|"
-        r"average order value)\b", q
-    ):
-        return "average"
-
-    if re.search(r"\b(count|number of|how many orders)\b", q):
-        return "count"
-
-    if re.search(r"\b(maximum|highest|largest|most expensive)\b", q):
-        return "max"
-
-    if re.search(r"\b(minimum|lowest|smallest|cheapest)\b", q):
-        return "min"
-
-    return "sum"
-
-
-def requested_status(question):
-    q = question.lower()
-
-    if re.search(r"\bpaid\b", q):
-        return "paid"
-
-    if re.search(r"\b(unpaid|not paid|pending payment)\b", q):
-        return "unpaid"
-
-    if re.search(r"\b(cancelled|canceled)\b", q):
-        return "cancelled"
-
-    return None
-
-
-def requested_region(question):
+def get_month(question):
     match = re.search(
-        r"\b(?:in|from|for)\s+(?:the\s+)?"
+        r"\b(january|february|march|april|may|june|july|"
+        r"august|september|october|november|december)"
+        r"\s+(20\d{2})\b",
+        question.lower(),
+    )
+
+    if not match:
+        match = re.search(r"\b(20\d{2})-(0[1-9]|1[0-2])\b",
+                          question)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+        return None
+
+    return int(match.group(2)), MONTHS[match.group(1)]
+
+
+def get_region(question):
+    match = re.search(
+        r"\b(?:from|in|for|within)\s+(?:the\s+)?"
         r"(north|south|east|west|central)\s+region\b",
-        question,
-        re.IGNORECASE,
+        question.lower(),
     )
 
     if match:
         return match.group(1).title()
 
-    # "West Order" / "West orders"
     match = re.search(
         r"\b(north|south|east|west|central)\s+orders?\b",
-        question,
-        re.IGNORECASE,
+        question.lower(),
     )
 
     return match.group(1).title() if match else None
 
 
-def requested_month(question):
-    months = {
-        "january": 1, "february": 2, "march": 3,
-        "april": 4, "may": 5, "june": 6,
-        "july": 7, "august": 8, "september": 9,
-        "october": 10, "november": 11, "december": 12,
-    }
+def get_status(question):
+    q = question.lower()
 
-    match = re.search(
-        r"\b(" + "|".join(months) + r")\s+(20\d{2})\b",
-        question.lower(),
-    )
+    if re.search(r"\b(refunded|refunds?)\b", q):
+        return "refunded"
 
-    if not match:
-        return None
+    if re.search(r"\b(void|voided)\b", q):
+        return "void"
 
-    start = pd.Timestamp(
-        year=int(match.group(2)),
-        month=months[match.group(1)],
-        day=1,
-    )
+    if re.search(r"\b(cancelled|canceled)\b", q):
+        return "cancelled"
 
-    return start, start + pd.offsets.MonthBegin(1)
+    if re.search(r"\b(unpaid|not paid|pending)\b", q):
+        return "unpaid"
+
+    if re.search(r"\bpaid\b", q):
+        return "paid"
+
+    return None
+
+
+def get_currency(question):
+    q = question.lower()
+
+    if re.search(r"\b(eur|euros?)\b", q):
+        return "EUR"
+
+    if re.search(r"\b(inr|rupees?)\b|₹", q):
+        return "INR"
+
+    return "USD"
+
+
+def get_operation(question):
+    q = question.lower()
+
+    if (
+        "top selling product" in q
+        or "top-selling product" in q
+        or "best-selling product" in q
+        or "product by revenue" in q
+        or "top product" in q
+    ):
+        return "top_product"
+
+    if (
+        "top customer" in q
+        or "customer by revenue" in q
+        or "highest spending customer" in q
+    ):
+        return "top_customer"
+
+    if re.search(r"\b(how many|count|number of)\b", q):
+        return "count"
+
+    if re.search(r"\b(average|on average|mean)\b", q):
+        return "average"
+
+    if re.search(r"\b(highest|maximum|largest)\b", q):
+        return "maximum"
+
+    if re.search(r"\b(lowest|minimum|smallest)\b", q):
+        return "minimum"
+
+    return "sum"
+
+
+def get_metric(question):
+    q = question.lower()
+
+    if "refund" in q:
+        return "refund"
+
+    if "customer" in q and re.search(
+        r"\b(how many|count|number of)\b", q
+    ):
+        return "customer_count"
+
+    if "product" in q and re.search(
+        r"\b(how many|count|number of)\b", q
+    ):
+        return "product_count"
+
+    if "unit" in q or "quantity" in q:
+        return "quantity"
+
+    return "revenue"
+
+
+def matches_month(row, month):
+    if month is None:
+        return True
+
+    dt = parse_datetime(row.get("created_at"))
+    if dt is None:
+        return False
+
+    return (dt.year, dt.month) == month
+
+
+def filter_orders(question):
+    rows = DATA["orders"]
+    month = get_month(question)
+    region = get_region(question)
+    status = get_status(question)
+    q = question.lower()
+
+    result = []
+
+    for row in rows:
+        if not matches_month(row, month):
+            continue
+
+        if region and str(row.get("region", "")).lower() != region.lower():
+            continue
+
+        row_status = str(row.get("status", "")).lower()
+
+        if status == "paid" and row_status != "paid":
+            continue
+        elif status == "refunded" and row_status != "refunded":
+            continue
+        elif status == "void" and row_status != "void":
+            continue
+        elif status == "cancelled" and row_status not in {
+            "cancelled", "canceled"
+        }:
+            continue
+        elif status == "unpaid" and row_status not in {
+            "unpaid", "pending", "failed"
+        }:
+            continue
+
+        # Revenue/sales questions count only paid orders by default.
+        if status is None and (
+            "revenue" in q or "sales" in q or "top selling" in q
+        ):
+            if row_status != "paid":
+                continue
+
+        # Match a named product if the question explicitly includes it.
+        product_match = re.search(
+            r"\bproduct\s+['\"]?([a-z0-9 -]+?)['\"]?"
+            r"(?=\s+(?:in|from|for|during|with|by)\b|[?.!,]|$)",
+            question,
+            re.IGNORECASE,
+        )
+
+        if product_match:
+            product_name = product_match.group(1).strip()
+            if str(row.get("product", "")).lower() != product_name.lower():
+                continue
+
+        # Match a named customer ID, e.g. customer C1054.
+        customer_match = re.search(
+            r"\bcustomer\s+(C\d+)\b", question, re.IGNORECASE
+        )
+        if customer_match:
+            if str(row.get("customer", "")).lower() != (
+                customer_match.group(1).lower()
+            ):
+                continue
+
+        result.append(row)
+
+    return result
 
 
 # ---------------------------------------------------------
-# Analysis engine
+# Calculations
 # ---------------------------------------------------------
+
+def amount_in_currency(row, currency="USD", metric="revenue"):
+    if metric == "quantity":
+        return decimal_value(row.get("qty")) or Decimal("0")
+
+    amount = decimal_value(row.get("amount"))
+
+    if amount is None:
+        qty = decimal_value(row.get("qty"))
+        price = decimal_value(row.get("unit_price"))
+
+        if qty is None or price is None:
+            return Decimal("0")
+
+        amount = qty * price
+
+    source_currency = row.get("currency") or "USD"
+
+    return DATA["converter"].convert(
+        amount,
+        source_currency,
+        currency,
+    )
+
+
+def get_refund_rows():
+    """
+    Prefer explicit refund records from the export if available.
+    Otherwise, use orders whose status is refunded.
+    """
+    explicit = DATA.get("refund_records")
+
+    if explicit is not None:
+        return explicit
+
+    return [
+        row for row in DATA["orders"]
+        if str(row.get("status", "")).lower() == "refunded"
+    ]
+
+
+def aggregate_by(rows, field, currency="USD", metric="revenue"):
+    totals = defaultdict(Decimal)
+
+    for row in rows:
+        key = row.get(field)
+        if key is None:
+            continue
+
+        value = amount_in_currency(row, currency, metric)
+        totals[str(key)] += value
+
+    return totals
+
 
 def analyze(question):
-    q = question.lower()
-    df = ORDERS.copy()
-
-    operation = requested_operation(question)
-    target_currency = requested_currency(question)
-
-    # Date filter.
-    date_range = requested_month(question)
-
-    if date_range:
-        date_col = get_column(df, "date")
-
-        if not date_col:
-            raise ValueError(
-                "The dataset has no recognized date column."
-            )
-
-        dates = pd.to_datetime(
-            df[date_col], errors="coerce", utc=True
+    if DATA is None:
+        raise RuntimeError(
+            f"Data loading failed: {LOAD_ERROR or 'unknown error'}"
         )
 
-        start, end = date_range
-        start = start.tz_localize("UTC")
-        end = end.tz_localize("UTC")
+    operation = get_operation(question)
+    metric = get_metric(question)
+    currency = get_currency(question)
+    rows = filter_orders(question)
 
-        df = df.loc[
-            (dates >= start) & (dates < end)
-        ].copy()
-
-    # Region filter.
-    region = requested_region(question)
-
-    if region:
-        region_col = get_column(df, "region")
-
-        if not region_col:
-            raise ValueError(
-                "A region was requested, but no region column "
-                "was found."
+    if metric == "refund":
+        rows = [
+            row for row in get_refund_rows()
+            if isinstance(row, dict)
+            and matches_month(row, get_month(question))
+            and (
+                not get_region(question)
+                or str(row.get("region", "")).lower()
+                == get_region(question).lower()
             )
+        ]
 
-        df = df[
-            df[region_col].astype(str).str.strip().str.lower()
-            == region.lower()
-        ].copy()
+    if metric == "customer_count":
+        return str(len({
+            row.get("customer")
+            for row in rows
+            if row.get("customer") is not None
+        }))
 
-    # Paid/unpaid/cancelled filter.
-    status = requested_status(question)
-
-    if status:
-        status_col = get_column(df, "status")
-
-        if not status_col:
-            raise ValueError(
-                f"Status '{status}' was requested, but no status "
-                "column was found."
-            )
-
-        values = (
-            df[status_col]
-            .astype(str)
-            .str.strip()
-            .str.lower()
-        )
-
-        if status == "paid":
-            # Extend this set if the API uses other documented
-            # paid-status values.
-            df = df[
-                values.isin({"paid", "completed", "succeeded"})
-            ].copy()
-
-        elif status == "unpaid":
-            df = df[
-                values.isin({
-                    "unpaid", "pending", "awaiting payment"
-                })
-            ].copy()
-
-        elif status == "cancelled":
-            df = df[
-                values.isin({"cancelled", "canceled"})
-            ].copy()
-
-    # Product filter.
-    product_col = get_column(df, "product")
-
-    if product_col:
-        for product in df[product_col].dropna().unique():
-            if str(product).strip().lower() in q:
-                df = df[df[product_col] == product].copy()
-                break
-
-    # Customer filter.
-    customer_col = get_column(df, "customer")
-
-    if customer_col:
-        for customer in df[customer_col].dropna().unique():
-            name = str(customer).strip()
-
-            if len(name) >= 3 and name.lower() in q:
-                df = df[df[customer_col] == customer].copy()
-                break
+    if metric == "product_count":
+        return str(len({
+            row.get("product")
+            for row in rows
+            if row.get("product") is not None
+        }))
 
     if operation == "count":
-        return int(len(df))
+        return str(len(rows))
 
-    if df.empty:
-        raise ValueError(
-            "No orders matched the requested filters."
-        )
+    if operation == "top_product":
+        if metric == "quantity":
+            totals = aggregate_by(rows, "product", currency, "quantity")
+        else:
+            # Revenue ranking is based on total converted revenue,
+            # not on the number of units sold.
+            totals = aggregate_by(rows, "product", currency, "revenue")
 
-    # Choose monetary metric.
-    is_refund = bool(
-        re.search(r"\b(refund|refunded|refunds)\b", q)
-    )
+        if not totals:
+            return "No matching product data found"
 
-    amount_col = (
-        get_column(df, "refund")
-        if is_refund
-        else get_column(df, "amount")
-    )
+        # Stable tie-breaking: product name alphabetically.
+        winner = sorted(
+            totals.items(),
+            key=lambda item: (-item[1], item[0].lower(), item[0]),
+        )[0]
 
-    if not amount_col:
-        metric = "refund amount" if is_refund else "order amount"
-        raise ValueError(
-            f"Could not identify the {metric} column. "
-            f"Available columns: {list(df.columns)}"
-        )
+        return winner[0]
 
-    currency_col = get_column(df, "currency")
+    if operation == "top_customer":
+        totals = aggregate_by(rows, "customer", currency, "revenue")
 
-    # Convert every row before aggregating.
-    converted = []
+        if not totals:
+            return "No matching customer data found"
 
-    for _, row in df.iterrows():
-        raw_amount = row[amount_col]
+        winner = sorted(
+            totals.items(),
+            key=lambda item: (-item[1], item[0].lower(), item[0]),
+        )[0]
 
-        if pd.isna(raw_amount):
-            continue
+        return winner[0]
 
-        try:
-            amount = Decimal(str(raw_amount))
-        except Exception:
-            continue
+    if metric == "quantity":
+        values = [
+            decimal_value(row.get("qty"))
+            for row in rows
+            if decimal_value(row.get("qty")) is not None
+        ]
+    else:
+        values = [
+            amount_in_currency(row, currency, "revenue")
+            for row in rows
+        ]
 
-        source_currency = (
-            str(row[currency_col]).strip().upper()
-            if currency_col and pd.notna(row[currency_col])
-            else DEFAULT_CURRENCY
-        )
-
-        if source_currency != target_currency:
-            amount = convert_currency(
-                amount, source_currency, target_currency, RATES
-            )
-
-        converted.append(amount)
-
-    if not converted:
-        raise ValueError(
-            "No valid monetary values were available."
-        )
+    if not values:
+        return "No matching data found"
 
     if operation == "average":
-        result = sum(converted) / Decimal(len(converted))
-    elif operation == "max":
-        result = max(converted)
-    elif operation == "min":
-        result = min(converted)
-    else:
-        result = sum(converted)
+        return money(sum(values, Decimal("0")) / Decimal(len(values)))
 
-    return float(
-        result.quantize(
-            Decimal("0.01"), rounding=ROUND_HALF_UP
-        )
-    )
+    if operation == "maximum":
+        return money(max(values))
 
+    if operation == "minimum":
+        return money(min(values))
 
-def convert_currency(amount, source, target, rates):
-    """Convert through USD, using the configured rate convention."""
-
-    source = source.upper()
-    target = target.upper()
-
-    usd_amount = to_usd(amount, source, rates)
-
-    if target == "USD":
-        return usd_amount
-
-    if target not in rates:
-        raise ValueError(
-            f"No exchange rate found for {target}."
-        )
-
-    if RATE_MODE == "units_per_usd":
-        return usd_amount * rates[target]
-
-    return usd_amount / rates[target]
+    return money(sum(values, Decimal("0")))
 
 
 # ---------------------------------------------------------
-# Startup and HTTP routes
+# HTTP endpoints
 # ---------------------------------------------------------
-
-@app.on_event("startup")
-def startup():
-    global ORDERS, RATES, EXPORTS
-
-    metadata = get_json(METADATA_URL)
-    endpoints = discover_endpoints(metadata)
-
-    log.info("Discovered endpoints: %s", list(endpoints))
-
-    if "orders" not in endpoints:
-        raise RuntimeError(
-            "Orders URL not found in metadata. "
-            "Inspect the metadata structure and update "
-            "discover_endpoints()."
-        )
-
-    ORDERS = load_orders(endpoints["orders"])
-
-    rates_payload = (
-        get_json(endpoints["rates"])
-        if "rates" in endpoints
-        else {}
-    )
-
-    EXPORTS = (
-        get_json(endpoints["exports"])
-        if "exports" in endpoints
-        else None
-    )
-
-    RATES = build_rates(rates_payload)
-
-    log.info("Order columns: %s", list(ORDERS.columns))
-    log.info("Currency codes loaded: %s", list(RATES.keys()))
-
 
 @app.get("/health")
 def health():
     return {
-        "status": "ok",
-        "orders_loaded": len(ORDERS),
-        "columns": list(ORDERS.columns),
-        "currency_codes": list(RATES.keys()),
+        "status": "ok" if DATA is not None else "error",
+        "orders_loaded": len(DATA["orders"]) if DATA else 0,
+        "error": LOAD_ERROR,
     }
 
 
 @app.post("/")
-def answer_question(body: QuestionRequest):
+def answer_question(request: QuestionRequest):
     try:
-        return {"answer": analyze(body.question)}
+        answer = analyze(request.question)
+        return {"answer": answer}
+    except Exception as exc:
+        logger.exception("Question processing failed")
+        raise HTTPException(status_code=500, detail=str(exc))
 
-    except ValueError as exc:
-        log.warning("Question could not be answered: %s", exc)
-        raise HTTPException(status_code=422, detail=str(exc))
 
-    except Exception:
-        log.exception("Question processing failed")
-        raise HTTPException(
-            status_code=500,
-            detail="Unable to process the question."
-        )
+@app.post("/reload")
+def reload_data():
+    global DATA, LOAD_ERROR
+
+    try:
+        DATA = load_data()
+        LOAD_ERROR = None
+        return {
+            "status": "ok",
+            "orders_loaded": len(DATA["orders"]),
+        }
+    except Exception as exc:
+        LOAD_ERROR = str(exc)
+        logger.exception("Reload failed")
+        raise HTTPException(status_code=500, detail=LOAD_ERROR)
 
